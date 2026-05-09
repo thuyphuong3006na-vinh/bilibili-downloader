@@ -2,11 +2,8 @@ import streamlit as st
 import subprocess
 import sys
 import os
-import json
 import re
 import requests
-import threading
-import queue
 
 st.set_page_config(
     page_title="Bilibili Downloader",
@@ -23,6 +20,16 @@ HEADERS = {
     "Accept-Language": "zh-CN,zh;q=0.9",
 }
 
+def extract_uid(text):
+    text = text.strip().split("?")[0].split("#")[0]  # bỏ query string
+    if text.isdigit():
+        return text
+    for pat in [r"space\.bilibili\.com/(\d+)", r"bilibili\.com/space/(\d+)"]:
+        m = re.search(pat, text)
+        if m:
+            return m.group(1)
+    return None
+
 def get_user_info(uid):
     try:
         r = requests.get(
@@ -36,26 +43,29 @@ def get_user_info(uid):
         pass
     return {}
 
-def fetch_channel_videos(uid, max_videos=0):
+def fetch_channel_videos(uid, max_videos=10):
     videos, page, ps = [], 1, 50
     while True:
         url = (f"https://api.bilibili.com/x/space/arc/search"
                f"?mid={uid}&pn={page}&ps={ps}&order=pubdate&jsonp=jsonp")
         try:
-            data = requests.get(url, headers=HEADERS, timeout=15).json()
-        except:
+            r = requests.get(url, headers=HEADERS, timeout=15)
+            data = r.json()
+        except Exception as e:
+            st.error(f"Lỗi kết nối API: {e}")
             break
         if data.get("code") != 0:
+            st.error(f"API Bilibili trả lỗi: {data.get('message')} (code {data.get('code')})")
             break
         vlist = data["data"]["list"]["vlist"]
         if not vlist:
             break
         for v in vlist:
             videos.append({
-                "bvid": v["bvid"],
-                "title": v["title"],
+                "bvid":     v["bvid"],
+                "title":    v["title"],
                 "duration": v.get("length", ""),
-                "play": v.get("play", 0),
+                "play":     v.get("play", 0),
             })
             if max_videos and len(videos) >= max_videos:
                 break
@@ -66,54 +76,35 @@ def fetch_channel_videos(uid, max_videos=0):
         page += 1
     return videos
 
-def extract_uid(text):
-    text = text.strip()
-    if text.isdigit():
-        return text
-    for pat in [r"space\.bilibili\.com/(\d+)", r"bilibili\.com/space/(\d+)"]:
-        m = re.search(pat, text)
-        if m:
-            return m.group(1)
-    return None
+QUALITY_MAP = {
+    "Tốt nhất (tự động)": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+    "720p":  "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best",
+    "480p":  "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/best",
+    "360p":  "bestvideo[height<=360][ext=mp4]+bestaudio[ext=m4a]/best",
+}
 
-def build_cmd(mode, target, quality, max_videos=0, subtitle=False, delay=2):
-    q_map = {
-        "Tốt nhất (tự động)": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-        "1080p": "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best",
-        "720p":  "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best",
-        "480p":  "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/best",
-        "360p":  "bestvideo[height<=360][ext=mp4]+bestaudio[ext=m4a]/best",
-    }
+def run_ytdlp(url, quality, subtitle=False, output_dir="/tmp/bilibili"):
+    os.makedirs(output_dir, exist_ok=True)
     cmd = [
         sys.executable, "-m", "yt_dlp",
-        "--format", q_map.get(quality, "best"),
+        "--format", QUALITY_MAP.get(quality, "best"),
         "--merge-output-format", "mp4",
-        "--output", "/tmp/bilibili/%(title)s [%(id)s].%(ext)s",
+        "--output", f"{output_dir}/%(title)s [%(id)s].%(ext)s",
         "--no-playlist",
+        "--no-warnings",
+        "--add-header", "Referer:https://www.bilibili.com",
     ]
     if subtitle:
         cmd += ["--write-subs", "--write-auto-subs", "--sub-langs", "zh-Hans,en"]
-
-    if mode == "video":
-        if target.upper().startswith("BV"):
-            cmd.append(f"https://www.bilibili.com/video/{target}")
-        else:
-            cmd.append(target)
-    else:
-        uid = extract_uid(target)
-        if not uid:
-            return None, "Không tìm thấy UID từ link kênh"
-        base = f"https://space.bilibili.com/{uid}/video"
-        cmd += ["--playlist-end", str(max_videos) if max_videos > 0 else "999999"]
-        cmd.append(base)
-
-    return cmd, None
+    cmd.append(url)
+    return cmd
 
 
-# ── UI ──────────────────────────────────────────────────────────
+# ── TABS ────────────────────────────────────────────────────────
 
 tab1, tab2 = st.tabs(["⬇ Tải video đơn", "📦 Tải theo kênh"])
 
+# ── Tab 1: Video đơn ────────────────────────────────────────────
 with tab1:
     st.subheader("Tải video đơn lẻ")
     url_input = st.text_input(
@@ -122,48 +113,51 @@ with tab1:
     )
     col1, col2 = st.columns(2)
     with col1:
-        quality1 = st.selectbox("Chất lượng", ["Tốt nhất (tự động)", "1080p", "720p", "480p", "360p"], key="q1")
+        quality1 = st.selectbox("Chất lượng", list(QUALITY_MAP.keys()), key="q1")
     with col2:
         subtitle1 = st.checkbox("Tải kèm phụ đề", key="s1")
 
     if st.button("▶ Bắt đầu tải", key="btn1", type="primary"):
-        if not url_input.strip():
+        raw = url_input.strip()
+        if not raw:
             st.warning("Vui lòng nhập link hoặc BVID!")
         else:
-            cmd, err = build_cmd("video", url_input.strip(), quality1, subtitle=subtitle1)
-            if err:
-                st.error(err)
+            if raw.upper().startswith("BV"):
+                video_url = f"https://www.bilibili.com/video/{raw}"
             else:
-                st.info("⏳ Đang tải... (Streamlit Cloud không lưu file lâu dài — xem hướng dẫn bên dưới)")
-                log_box = st.empty()
-                log_lines = []
-                os.makedirs("/tmp/bilibili", exist_ok=True)
+                video_url = raw.split("?")[0]  # bỏ query string
+
+            cmd = run_ytdlp(video_url, quality1, subtitle1)
+            log_box = st.empty()
+            log_lines = []
+            with st.spinner("⏳ Đang tải..."):
                 try:
                     proc = subprocess.Popen(
-                        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                        text=True, bufsize=1
+                        cmd, stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT, text=True
                     )
                     for line in proc.stdout:
                         log_lines.append(line.rstrip())
-                        log_box.code("\n".join(log_lines[-30:]))
+                        log_box.code("\n".join(log_lines[-20:]))
                     proc.wait()
                     if proc.returncode == 0:
                         st.success("✅ Tải xong!")
-                        files = os.listdir("/tmp/bilibili")
-                        for f in files:
+                        for f in os.listdir("/tmp/bilibili"):
                             fp = f"/tmp/bilibili/{f}"
                             with open(fp, "rb") as fh:
                                 st.download_button(
-                                    label=f"⬇ Tải về: {f}",
+                                    label=f"⬇ Tải về máy: {f}",
                                     data=fh,
                                     file_name=f,
-                                    mime="video/mp4"
+                                    mime="video/mp4",
+                                    key=f"dl_{f}"
                                 )
                     else:
-                        st.error("❌ Có lỗi xảy ra. Xem log ở trên.")
+                        st.error("❌ Tải thất bại. Xem log ở trên.")
                 except Exception as e:
                     st.error(f"Lỗi: {e}")
 
+# ── Tab 2: Tải theo kênh ────────────────────────────────────────
 with tab2:
     st.subheader("Tải hàng loạt theo kênh")
     ch_input = st.text_input(
@@ -171,65 +165,82 @@ with tab2:
         placeholder="12345678  hoặc  https://space.bilibili.com/12345678"
     )
 
+    # Hiển thị thông tin kênh khi nhập URL
     uid_preview = extract_uid(ch_input) if ch_input.strip() else None
     if uid_preview:
-        with st.spinner("Đang lấy thông tin kênh..."):
-            info = get_user_info(uid_preview)
-        if info:
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Tên kênh", info.get("name", "—"))
-            c2.metric("Fans", f"{info.get('fans', 0):,}")
-            c3.metric("UID", uid_preview)
+        st.caption(f"UID nhận được: `{uid_preview}`")
+        if st.button("🔍 Kiểm tra thông tin kênh"):
+            with st.spinner("Đang lấy thông tin..."):
+                info = get_user_info(uid_preview)
+            if info:
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Tên kênh", info.get("name", "—"))
+                c2.metric("Fans", f"{info.get('fans', 0):,}")
+                c3.metric("UID", uid_preview)
+            else:
+                st.warning("Không lấy được thông tin kênh. API có thể bị giới hạn.")
+    elif ch_input.strip():
+        st.error("❌ Không tìm thấy UID trong link này. Hãy thử copy lại link kênh.")
 
     col3, col4, col5 = st.columns(3)
     with col3:
-        quality2 = st.selectbox("Chất lượng", ["Tốt nhất (tự động)", "720p", "480p", "360p"], key="q2")
+        quality2 = st.selectbox("Chất lượng", list(QUALITY_MAP.keys()), key="q2")
     with col4:
-        max_vids = st.number_input("Số video tối đa", min_value=0, value=10, step=5,
-                                   help="0 = tải tất cả")
+        max_vids = st.number_input("Số video tối đa", min_value=1, value=5, step=1,
+                                   help="Streamlit Cloud giới hạn dung lượng, nên chọn ít")
     with col5:
         subtitle2 = st.checkbox("Tải kèm phụ đề", key="s2")
 
-    if st.button("🔍 Xem danh sách trước", key="btn_list"):
-        if not ch_input.strip():
-            st.warning("Nhập UID hoặc URL kênh!")
+    if st.button("🔍 Xem danh sách video trước", key="btn_list"):
+        uid = extract_uid(ch_input.strip()) if ch_input.strip() else None
+        if not uid:
+            st.error("Không tìm thấy UID!")
         else:
-            uid = extract_uid(ch_input.strip())
-            if not uid:
-                st.error("Không tìm thấy UID!")
-            else:
-                with st.spinner(f"Đang lấy danh sách video..."):
-                    videos = fetch_channel_videos(uid, max_vids if max_vids > 0 else 20)
+            with st.spinner("Đang lấy danh sách..."):
+                videos = fetch_channel_videos(uid, int(max_vids))
+            if videos:
                 st.success(f"Tìm thấy {len(videos)} video")
                 for i, v in enumerate(videos, 1):
-                    st.write(f"`{i}.` [{v['title']}](https://www.bilibili.com/video/{v['bvid']}) — {v['duration']}")
+                    st.write(f"`{i}.` [{v['title']}](https://www.bilibili.com/video/{v['bvid']}) — ⏱ {v['duration']} — ▶ {v['play']:,} lượt xem")
+            else:
+                st.error("Không tìm thấy video nào. API Bilibili có thể đang bị giới hạn từ Streamlit Cloud.")
 
     if st.button("▶ Bắt đầu tải kênh", key="btn2", type="primary"):
-        if not ch_input.strip():
-            st.warning("Nhập UID hoặc URL kênh!")
+        uid = extract_uid(ch_input.strip()) if ch_input.strip() else None
+        if not uid:
+            st.error("Không tìm thấy UID!")
         else:
-            st.info("⏳ Đang tải hàng loạt...")
-            uid = extract_uid(ch_input.strip())
-            if not uid:
-                st.error("Không tìm thấy UID!")
+            with st.spinner("Đang lấy danh sách video..."):
+                videos = fetch_channel_videos(uid, int(max_vids))
+            if not videos:
+                st.error("Không lấy được danh sách video!")
             else:
-                videos = fetch_channel_videos(uid, max_vids if max_vids > 0 else 0)
+                st.info(f"Bắt đầu tải {len(videos)} video...")
                 prog = st.progress(0)
                 status = st.empty()
                 os.makedirs("/tmp/bilibili", exist_ok=True)
                 done = 0
                 for i, v in enumerate(videos):
-                    status.write(f"⬇ [{i+1}/{len(videos)}] {v['title'][:60]}")
-                    cmd, _ = build_cmd("video", v["bvid"], quality2, subtitle=subtitle2)
-                    subprocess.run(cmd, capture_output=True)
-                    done += 1
-                    prog.progress(done / len(videos))
-                st.success(f"✅ Đã tải {done}/{len(videos)} video!")
-                files = os.listdir("/tmp/bilibili")
+                    status.info(f"⬇ [{i+1}/{len(videos)}] {v['title'][:70]}")
+                    video_url = f"https://www.bilibili.com/video/{v['bvid']}"
+                    cmd = run_ytdlp(video_url, quality2, subtitle2)
+                    result = subprocess.run(cmd, capture_output=True, text=True)
+                    if result.returncode == 0:
+                        done += 1
+                    prog.progress((i + 1) / len(videos))
+
+                st.success(f"✅ Đã tải xong {done}/{len(videos)} video!")
+                files = [f for f in os.listdir("/tmp/bilibili") if f.endswith(".mp4")]
                 for f in files:
                     fp = f"/tmp/bilibili/{f}"
                     with open(fp, "rb") as fh:
-                        st.download_button(f"⬇ {f}", fh, file_name=f, mime="video/mp4")
+                        st.download_button(
+                            label=f"⬇ {f}",
+                            data=fh,
+                            file_name=f,
+                            mime="video/mp4",
+                            key=f"dl2_{f}"
+                        )
 
 st.divider()
-st.caption("⚠️ Streamlit Cloud lưu file tạm thời — tải về máy ngay sau khi xong. Để tải không giới hạn hãy chạy app trên máy cá nhân.")
+st.caption("⚠️ Streamlit Cloud lưu file tạm thời — tải về máy ngay sau khi xong.")
