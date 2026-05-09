@@ -17,7 +17,6 @@ bilibili_downloads/
 
 # Cookies (nhạy cảm - không upload lên GitHub!)
 cookies.txt
-*.txt
 
 # OS
 .DS_Store
